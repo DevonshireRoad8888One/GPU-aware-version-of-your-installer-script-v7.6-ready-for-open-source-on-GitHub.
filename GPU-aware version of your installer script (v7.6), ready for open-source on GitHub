@@ -1,0 +1,196 @@
+cat > "$HOME/rebuild_openwebui2ver7_v7.6.sh" <<'REBUILD76'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$HOME"
+
+BASE="$HOME/openwebui2ver7"
+WEBUI_PORT="8000"
+OLLAMA_PORT="11437"
+
+echo "=================================================="
+echo " 🚀 Open WebUI + Ollama + OTEL Installer v7.6"
+echo " GPU-Aware • Works on WSL2 / Native Linux"
+echo " Folder: $BASE"
+echo "=================================================="
+
+read -rp "This will DELETE $BASE and rebuild everything. Continue? [y/N] " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+  echo "Aborted."
+  exit 1
+fi
+
+# Backup old installation
+if [ -d "$BASE" ]; then
+  echo "Backing up old folder..."
+  mv "$BASE" "$BASE.backup.$(date +%Y%m%d_%H%M%S)"
+fi
+
+# System dependencies
+sudo apt update -y
+sudo apt install -y software-properties-common curl ca-certificates gnupg lsb-release \
+  psmisc iproute2 zstd ffmpeg build-essential pkg-config
+
+# Python 3.12
+if ! command -v python3.12 >/dev/null 2>&1; then
+  sudo add-apt-repository ppa:deadsnakes/ppa -y
+  sudo apt update
+fi
+sudo apt install -y python3.12 python3.12-dev python3.12-venv python3-pip
+
+# Ollama
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "Installing Ollama..."
+  curl -fsSL https://ollama.com/install.sh | sh
+fi
+
+# Fresh directories
+rm -rf "$BASE"
+mkdir -p "$BASE"/{data,models,logs,run}
+chmod 700 "$BASE" "$BASE"/{data,models,logs,run}
+
+# Create venv
+python3.12 -m venv "$BASE/env1"
+cd "$BASE"
+source "$BASE/env1/bin/activate"
+
+python -m pip install --upgrade pip setuptools wheel
+
+# === GPU-AWARE TORCH INSTALLATION ===
+echo "🔍 Detecting GPU support..."
+mkdir -p ~/pip_tmp
+export TMPDIR=~/pip_tmp
+
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi | grep -q "NVIDIA-SMI"; then
+  echo "✅ NVIDIA GPU detected → Installing PyTorch with CUDA support"
+  pip install --no-cache-dir \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu126
+else
+  echo "⚠️ No NVIDIA GPU detected → Installing CPU-only PyTorch"
+  pip install --no-cache-dir \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cpu
+fi
+
+# Install Open WebUI + OTEL
+echo "📦 Installing Open WebUI..."
+pip install --no-cache-dir open-webui
+
+echo "📦 Installing OpenTelemetry packages..."
+pip install --no-cache-dir \
+  opentelemetry-api \
+  opentelemetry-sdk \
+  opentelemetry-exporter-otlp \
+  opentelemetry-instrumentation \
+  opentelemetry-instrumentation-fastapi \
+  opentelemetry-instrumentation-httpx \
+  opentelemetry-instrumentation-aiohttp-client \
+  opentelemetry-instrumentation-logging \
+  opentelemetry-instrumentation-requests \
+  opentelemetry-instrumentation-redis \
+  opentelemetry-instrumentation-sqlalchemy \
+  opentelemetry-instrumentation-system-metrics
+
+deactivate
+
+# Secure secret key
+SECRET="$(python3.12 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+echo "$SECRET" > "$BASE/.webui_secret_key"
+chmod 600 "$BASE/.webui_secret_key"
+
+# .env file
+cat > "$BASE/.env" <<ENV
+WEBUI_PORT=$WEBUI_PORT
+OLLAMA_PORT=$OLLAMA_PORT
+WEBUI_SECRET_KEY=$SECRET
+
+WEBUI_AUTH=True
+ENABLE_SIGNUP=False
+WEBUI_DISABLE_SIGNUP=True
+JWT_EXPIRES_IN=30d
+ENABLE_PERSISTENT_CONFIG=True
+
+CORS_ALLOW_ORIGIN="http://127.0.0.1:$WEBUI_PORT;http://localhost:$WEBUI_PORT"
+OLLAMA_ORIGINS="http://127.0.0.1:$WEBUI_PORT,http://localhost:$WEBUI_PORT"
+
+HOST=127.0.0.1
+PORT=$WEBUI_PORT
+
+# OpenTelemetry
+ENABLE_OTEL=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+OTEL_EXPORTER_OTLP_INSECURE=true
+OTEL_SERVICE_NAME=open-webui
+OTEL_METRICS_EXPORT_INTERVAL_MILLIS=10000
+ENV
+
+chmod 600 "$BASE/.env"
+
+# start.sh (improved)
+cat > "$BASE/start.sh" <<'START76'
+#!/usr/bin/env bash
+set -euo pipefail
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$BASE/.env" ] && { set -a; . "$BASE/.env"; set +a; }
+
+export OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT:-11437}"
+export OLLAMA_BASE_URL="http://127.0.0.1:${OLLAMA_PORT:-11437}"
+export OLLAMA_MODELS="$BASE/models"
+export DATA_DIR="$BASE/data"
+
+mkdir -p "$BASE"/{data,models,logs,run}
+
+# Start Ollama
+if ! curl -fsS "http://127.0.0.1:${OLLAMA_PORT:-11437}/api/version" >/dev/null 2>&1; then
+  echo "🔄 Starting Ollama..."
+  nohup ollama serve > "$BASE/logs/ollama.log" 2>&1 &
+fi
+
+echo "🚀 Starting Open WebUI..."
+source "$BASE/env1/bin/activate"
+cd "$BASE"
+exec "$BASE/env1/bin/open-webui" serve --host 127.0.0.1 --port "${WEBUI_PORT:-8000}"
+START76
+
+# stop.sh and check-security.sh (simplified but functional)
+cat > "$BASE/stop.sh" <<'STOP76'
+#!/usr/bin/env bash
+echo "🛑 Stopping Open WebUI and Ollama..."
+pkill -f "open-webui serve" || true
+pkill -f "ollama serve" || true
+echo "✅ Services stopped."
+STOP76
+
+cat > "$BASE/check-security.sh" <<'CHECK76'
+#!/usr/bin/env bash
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "=================================================="
+echo "🔒 Open WebUI Security & Status Check"
+echo "=================================================="
+ss -ltnp | grep -E ':8000|:11437' || echo "No services listening on ports"
+ls -ld "$BASE" "$BASE/data" "$BASE/models" 2>/dev/null || true
+ls -l "$BASE/.env" "$BASE/.webui_secret_key" 2>/dev/null || true
+curl -fsS "http://127.0.0.1:11437/api/version" >/dev/null 2>&1 && echo "✅ Ollama OK" || echo "⚠️ Ollama not responding"
+echo "=================================================="
+CHECK76
+
+chmod +x "$BASE"/{start.sh,stop.sh,check-security.sh}
+chmod 600 "$BASE/.env" "$BASE/.webui_secret_key"
+chmod 700 "$BASE" "$BASE"/{data,models,logs,run}
+
+echo "=================================================="
+echo "✅ Installation complete! (v7.6 GPU-aware)"
+echo "Start:   $BASE/start.sh"
+echo "Stop:    $BASE/stop.sh"
+echo "Check:   $BASE/check-security.sh"
+echo "WebUI:   http://127.0.0.1:$WEBUI_PORT"
+echo "=================================================="
+
+cd "$BASE"
+./start.sh
+REBUILD76
+
+chmod +x "$HOME/rebuild_openwebui2ver7_v7.6.sh"
+echo "✅ GPU-aware installer v7.6 created at ~/rebuild_openwebui2ver7_v7.6.sh"
+echo "You can now push this to GitHub!"
